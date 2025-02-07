@@ -1,0 +1,10 @@
+datetime
+jax
+jaxlib
+matplotlib
+numpy
+pandas
+plotly
+scipy
+streamlit
+yfinance
