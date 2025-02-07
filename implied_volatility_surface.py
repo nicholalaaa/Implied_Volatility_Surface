@@ -151,8 +151,8 @@ st.sidebar.header('Strike Price Filter Parameters')
 
 min_strike_pct = st.sidebar.number_input(
     'Minimum Strike Price (% of Spot Price)',
-    min_value=50.0,
-    max_value=199.0,
+    min_value=10.0,
+    max_value=499.0,
     value=80.0,
     step=1.0,
     format="%.1f"
@@ -160,8 +160,8 @@ min_strike_pct = st.sidebar.number_input(
 
 max_strike_pct = st.sidebar.number_input(
     'Maximum Strike Price (% of Spot Price)',
-    min_value=51.0,
-    max_value=200.0,
+    min_value=11.0,
+    max_value=500.0,
     value=120.0,
     step=1.0,
     format="%.1f"
