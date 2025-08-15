@@ -173,8 +173,8 @@ if raw_options.empty:
 df = raw_options.rename(columns=str.lower).copy()
 df = df[(df["bid"] > 0) & (df["ask"] > 0)]
 df["mid"] = (df["bid"] + df["ask"]) / 2.0
-df["daysToExpiration"] = (pd.to_datetime(df["expirationdate"]) - today).dt.days
-df["timeToExpiration"] = df["daystoexpiration"] / 365.0
+df["daystoexpiration"] = (pd.to_datetime(df["expirationdate"]) - today).dt.days
+df["timetoexpiration"] = df["daystoexpiration"] / 365.0
 
 # user filters
 df = df[df["otype"].str.lower() == otype.lower()]
