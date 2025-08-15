@@ -1,7 +1,4 @@
 from datetime import timedelta
-from jax import grad
-import jax.numpy as jnp
-from jax.scipy.stats import norm as jnorm
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -10,292 +7,250 @@ import streamlit as st
 import yfinance as yf
 
 
-st.title('Implied Volatility Surface')
+def _norm_cdf(x: np.ndarray) -> np.ndarray:
+    # erf-based normal CDF (fast, no SciPy)
+    return 0.5 * (1.0 + np.erf(x / np.sqrt(2.0)))
 
 
-def black_scholes(
-    S: float,
-    K: float,
-    T: int,
-    r: float,
-    sigma: float,
-    q: float = 0,
-    otype: str = "call"
-) -> float:
-
-    d1 = (jnp.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * jnp.sqrt(T))
-    d2 = d1 - sigma * jnp.sqrt(T)
-    if otype == "call":
-        return S * jnp.exp(-q * T) * jnorm.cdf(d1, 0, 1) - K * jnp.exp(-r * T) * jnorm.cdf(d2, 0, 1)
-    elif otype == "put":
-        return -S * jnp.exp(-q * T) * jnorm.cdf(-d1, 0, 1) + K * jnp.exp(-r * T) * jnorm.cdf(-d2, 0, 1)
+def bs_price(S, K, T, r, q, sigma, otype="call"):
+    """
+    Vectorized Black–Scholes price (arrays broadcastable).
+    """
+    sqrtT = np.sqrt(T)
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
+    d2 = d1 - sigma * sqrtT
+    disc_q = np.exp(-q * T)
+    disc_r = np.exp(-r * T)
+    if otype.lower() == "call":
+        return S * disc_q * _norm_cdf(d1) - K * disc_r * _norm_cdf(d2)
+    else:
+        return K * disc_r * _norm_cdf(-d2) - S * disc_q * _norm_cdf(-d1)
 
 
-def solve_for_iv(
-    S: float,
-    K: float,
-    T: int,
-    r: float,
-    price: float,
-    sigma_guess: float = 0.5,
-    q: float = 0,
-    otype: str = "call",
-    N_iter: int = 20,
-    epsilon: float = 0.001,
-    verbose: bool = False
-) -> float:
+def bs_vega(S, K, T, r, q, sigma):
+    """
+    Vectorized Black–Scholes vega (dPrice/dSigma).
+    """
+    sqrtT = np.sqrt(T)
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
+    pdf = np.exp(-0.5 * d1 * d1) / np.sqrt(2.0 * np.pi)
+    return S * np.exp(-q * T) * pdf * sqrtT
 
-    if T <= 0 or price <= 0:
-        return jnp.nan
 
-    converged = False
-    # 1. Make a guess for the volatility
-    sigma = sigma_guess
-    for i in range(N_iter):
+def intrinsic_value(S, K, T, r, q, otype="call"):
+    """
+    Present-value intrinsic under Black–Scholes (with r,q).
+    """
+    if otype.lower() == "call":
+        return np.maximum(0.0, S * np.exp(-q * T) - K * np.exp(-r * T))
+    else:
+        return np.maximum(0.0, K * np.exp(-r * T) - S * np.exp(-q * T))
 
-        # 2. Calculate the loss function
-        loss_val = loss_func(S, K, T, r, sigma, price, q, otype=otype)
 
-        if verbose:
-            print("\nIteration: ", i)
-            print("Current Error in Theoretical vs Market Price:")
-            print(loss_val)
+def implied_vol_newton_vectorized(
+    S, K, T, r, q, price, otype="call",
+    max_iter=25, tol=1e-4, sigma0=0.25
+):
+    """
+    Vectorized Newton–Raphson IV solver.
+    Inputs: 1D arrays (or broadcastable) of equal length.
+    Returns: sigma array with np.nan where not converged.
+    """
+    n = price.shape[0]
+    sigma = np.full(n, sigma0, dtype=float)
 
-        # 3. Check if the loss is less than the tolerance, $\epsilon$
+    # Validity mask: positive time, positive price, above intrinsic (slack)
+    intr = intrinsic_value(S, K, T, r, q, otype=otype)
+    valid = (T > 0) & (price > 0) & (price >= 0.999 * intr)
 
-        # If yes, STOP!
-        if abs(loss_val) < epsilon:
-            converged = True
+    # Iterate Newton only on valid points
+    for _ in range(max_iter):
+        idx = valid & np.isfinite(sigma)
+        if not np.any(idx):
             break
 
-        # If no, CONTINUE to step 4
-        else:
+        theo = bs_price(S[idx], K[idx], T[idx], r, q, sigma[idx], otype=otype)
+        diff = theo - price[idx]
+        done = np.abs(diff) < tol
+        if np.all(done):
+            valid[idx] = False
+            continue
 
-            # 4. Calculate the gradient of the loss function
-            loss_grad_val = loss_grad(S, K, T, r, sigma, price, q=q, otype=otype)
+        vega = bs_vega(S[idx], K[idx], T[idx], r, q, sigma[idx])
+        safe = vega > 1e-8
+        step = np.zeros_like(diff)
+        step[safe] = diff[safe] / vega[safe]
 
-            if verbose:
-                print("Gradient:", loss_grad_val)
+        # Damped update + clipping for stability
+        sigma_new = sigma[idx] - step
+        sigma[idx] = np.clip(sigma_new, 1e-6, 5.0)
 
-            # 5. Update the volatility using the Newton-Raphson formula
-            sigma = sigma - loss_val / loss_grad_val
+        # Mark converged ones as done
+        theo2 = bs_price(S[idx], K[idx], T[idx], r, q, sigma[idx], otype=otype)
+        valid[idx] = np.abs(theo2 - price[idx]) >= tol
 
-            if verbose:
-                print("New sigma: ", sigma)
-
-    if not converged:
-        return jnp.nan
-
+    # Non-converged -> NaN
+    sigma[~np.isfinite(sigma)] = np.nan
     return sigma
 
 
-def loss_func(
-    S: float,
-    K: float,
-    T: int,
-    r: float,
-    sigma_guess: float,
-    price: float,
-    q: float = 0,
-    otype: str = "call"
-) -> float:
+st.set_page_config(page_title="Implied Volatility Surface", layout="wide")
+st.title("Implied Volatility Surface")
 
-    # Price with the GUESS for the volatility
-    theoretical_price = black_scholes(S, K, T, r, sigma_guess, q=q, otype=otype)
+st.sidebar.header("Model Parameters")
+otype = st.sidebar.selectbox("Select Option Type:", ("Call", "Put"))
+r = st.sidebar.number_input("Risk-Free Rate (e.g., 0.015 = 1.5%)", value=0.015, format="%.4f")
+q = st.sidebar.number_input("Dividend Yield (e.g., 0.013 = 1.3%)", value=0.013, format="%.4f")
 
-    # Actual price
-    market_price = price
+st.sidebar.header("Visualization")
+y_axis_option = st.sidebar.selectbox("Select Y-axis:", ("Strike Price ($)", "Moneyness"))
+grid_res = st.sidebar.slider("Grid resolution (per axis)", min_value=20, max_value=80, value=50, step=5)
 
-    # Loss is the difference between the theoretical price and the actual price
-    # We want to MINIMIZE this loss!
-    return theoretical_price - market_price
+st.sidebar.header("Ticker & Data Limits")
+ticker_symbol = st.sidebar.text_input("Ticker", value="SPY", max_chars=10).upper()
+max_expiries = st.sidebar.slider("Max expiries (nearest)", min_value=3, max_value=20, value=10, step=1)
+max_opts_per_expiry = st.sidebar.slider("Max options per expiry", min_value=50, max_value=1000, value=400, step=50)
 
-
-loss_grad = grad(loss_func, argnums=4)
-
-
-st.sidebar.header('Model Parameters')
-st.sidebar.write('Adjust the parameters for the Black-Scholes model.')
-
-otype = st.sidebar.selectbox(
-    'Select Option Type:',
-    ('Call', 'Put')
-)
-
-r = st.sidebar.number_input(
-    'Risk-Free Rate (e.g., 0.015 for 1.5%)',
-    value=0.015,
-    format="%.4f"
-)
-
-q = st.sidebar.number_input(
-    'Dividend Yield (e.g., 0.013 for 1.3%)',
-    value=0.013,
-    format="%.4f"
-)
-
-st.sidebar.header('Visualization Parameters')
-y_axis_option = st.sidebar.selectbox(
-    'Select Y-axis:',
-    ('Strike Price ($)', 'Moneyness')
-)
-
-st.sidebar.header('Ticker Symbol')
-ticker_symbol = st.sidebar.text_input(
-    'Enter Ticker Symbol',
-    value='SPY',
-    max_chars=10
-).upper()
-
-st.sidebar.header('Strike Price Filter Parameters')
-
-min_strike_pct = st.sidebar.number_input(
-    'Minimum Strike Price (% of Spot Price)',
-    min_value=10.0,
-    max_value=499.0,
-    value=80.0,
-    step=1.0,
-    format="%.1f"
-)
-
-max_strike_pct = st.sidebar.number_input(
-    'Maximum Strike Price (% of Spot Price)',
-    min_value=11.0,
-    max_value=500.0,
-    value=120.0,
-    step=1.0,
-    format="%.1f"
-)
-
+st.sidebar.header("Strike Filter (% of Spot)")
+min_strike_pct = st.sidebar.number_input("Minimum %", min_value=10.0, max_value=499.0, value=80.0, step=1.0, format="%.1f")
+max_strike_pct = st.sidebar.number_input("Maximum %", min_value=11.0, max_value=500.0, value=120.0, step=1.0, format="%.1f")
 if min_strike_pct >= max_strike_pct:
-    st.sidebar.error('Minimum percentage must be less than maximum percentage.')
+    st.sidebar.error("Minimum percentage must be less than maximum percentage.")
     st.stop()
 
 
-ticker = yf.Ticker(ticker_symbol)
+@st.cache_resource(show_spinner=False)
+def cached_ticker(sym: str):
+    return yf.Ticker(sym)
 
-today = pd.Timestamp('today').normalize()
 
-try:
-    expirations = ticker.options
-except Exception as e:
-    st.error(f'Error fetching options for {ticker_symbol}: {e}')
-    st.stop()
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_options_and_spot(sym: str):
+    tk = cached_ticker(sym)
+    today = pd.Timestamp("today").normalize()
+    try:
+        expirations = tk.options
+    except Exception as e:
+        raise RuntimeError(f"Error fetching options for {sym}: {e}")
 
-exp_dates = [pd.Timestamp(exp) for exp in expirations if pd.Timestamp(exp) > today + timedelta(days=7)]
+    # keep expiries at least 7 days out; take nearest N
+    exp_dates = [pd.Timestamp(exp) for exp in expirations if pd.Timestamp(exp) > today + timedelta(days=7)]
+    exp_dates = sorted(exp_dates)[:max_expiries]
 
-if not exp_dates:
-    st.error(f'No available option expiration dates for {ticker_symbol}.')
-else:
-    option_data = []
-
+    rows = []
     for exp_date in exp_dates:
         try:
-            opt_chain = ticker.option_chain(exp_date.strftime('%Y-%m-%d'))
-            if otype == 'Call':
-                options = opt_chain.calls
-            elif otype == 'Put':
-                options = opt_chain.puts
+            oc = tk.option_chain(exp_date.strftime("%Y-%m-%d"))
         except Exception as e:
-            st.warning(f'Failed to fetch option chain for {exp_date.date()}: {e}')
+            # skip bad expiry
             continue
+        calls = oc.calls.assign(otype="call")
+        puts  = oc.puts.assign(otype="put")
+        df = pd.concat([calls, puts], ignore_index=True)
+        df["expirationDate"] = exp_date
+        rows.append(df)
 
-        options = options[(options['bid'] > 0) & (options['ask'] > 0)]
+    opt = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
-        for index, row in options.iterrows():
-            strike = row['strike']
-            bid = row['bid']
-            ask = row['ask']
-            mid_price = (bid + ask) / 2
+    hist = tk.history(period="5d")
+    if hist.empty:
+        raise RuntimeError(f"Failed to retrieve spot price for {sym}.")
+    spot = float(hist["Close"].iloc[-1])
 
-            option_data.append({
-                'expirationDate': exp_date,
-                'strike': strike,
-                'bid': bid,
-                'ask': ask,
-                'mid': mid_price
-            })
+    return opt, spot, today
 
-    if not option_data:
-        st.error('No option data available after filtering.')
-    else:
-        options_df = pd.DataFrame(option_data)
 
-        try:
-            spot_history = ticker.history(period='5d')
-            if spot_history.empty:
-                st.error(f'Failed to retrieve spot price data for {ticker_symbol}.')
-                st.stop()
-            else:
-                spot_price = spot_history['Close'].iloc[-1]
-        except Exception as e:
-            st.error(f'An error occurred while fetching spot price data: {e}')
-            st.stop()
+try:
+    raw_options, spot_price, today = fetch_options_and_spot(ticker_symbol)
+except Exception as e:
+    st.error(str(e))
+    st.stop()
 
-        options_df['daysToExpiration'] = (options_df['expirationDate'] - today).dt.days
-        options_df['timeToExpiration'] = options_df['daysToExpiration'] / 365
+if raw_options.empty:
+    st.error("No option chains available after fetching.")
+    st.stop()
 
-        options_df = options_df[
-            (options_df['strike'] >= spot_price * (min_strike_pct / 100)) &
-            (options_df['strike'] <= spot_price * (max_strike_pct / 100))
-        ]
+df = raw_options.rename(columns=str.lower).copy()
+df = df[(df["bid"] > 0) & (df["ask"] > 0)]
+df["mid"] = (df["bid"] + df["ask"]) / 2.0
+df["daysToExpiration"] = (pd.to_datetime(df["expirationdate"]) - today).dt.days
+df["timeToExpiration"] = df["daystoexpiration"] / 365.0
 
-        options_df.reset_index(drop=True, inplace=True)
+# user filters
+df = df[df["otype"].str.lower() == otype.lower()]
+df = df[(df["strike"] >= spot_price * (min_strike_pct / 100.0)) &
+        (df["strike"] <= spot_price * (max_strike_pct / 100.0))]
+df = df[df["timeToExpiration"] > 7/365.0]  # keep > ~1 week to avoid near-zero T
 
-        with st.spinner('Calculating implied volatility...'):
-            options_df['impliedVolatility'] = options_df.apply(
-                lambda row: solve_for_iv(
-                    price=row['mid'],
-                    S=spot_price,
-                    K=row['strike'],
-                    T=row['timeToExpiration'],
-                    r=r,
-                    q=q
-                ), axis=1
-            )
-        options_df.dropna(subset=['impliedVolatility'], inplace=True)
+# Downsample per expiry for speed (optional)
+df["expirationDate"] = pd.to_datetime(df["expirationdate"])
+df = df.sort_values(["expirationDate", "strike"])
+df = df.groupby("expirationDate", group_keys=False).head(max_opts_per_expiry).reset_index(drop=True)
 
-        options_df['impliedVolatility'] *= 100
+if df.empty:
+    st.error("No option rows after filters/downsampling.")
+    st.stop()
 
-        options_df.sort_values('strike', inplace=True)
+with st.spinner("Calculating implied volatility…"):
+    n = len(df)
+    S = np.full(n, spot_price, dtype=float)
+    K = df["strike"].to_numpy(dtype=float)
+    T = df["timetoexpiration"].to_numpy(dtype=float)
+    P = df["mid"].to_numpy(dtype=float)
 
-        options_df['moneyness'] = options_df['strike'] / spot_price
+    iv = implied_vol_newton_vectorized(S, K, T, r, q, P, otype=otype.lower(), max_iter=25, tol=1e-4, sigma0=0.25)
+    df = df.assign(impliedVolatility=iv)
+    df = df[np.isfinite(df["impliedVolatility"])].copy()
 
-        if y_axis_option == 'Strike Price ($)':
-            Y = options_df['strike']
-            y_label = 'Strike Price ($)'
-        else:
-            Y = options_df['moneyness']
-            y_label = 'Moneyness (Strike / Spot)'
+if df.empty:
+    st.error("No converged implied volatilities (try wider strike band or farther expiries).")
+    st.stop()
 
-        X = options_df['timeToExpiration'].values
-        Z = options_df['impliedVolatility'].values
+df["impliedVolatility"] *= 100.0  # percent
+df["moneyness"] = df["strike"] / spot_price
 
-        ti = np.linspace(X.min(), X.max(), 50)
-        ki = np.linspace(Y.min(), Y.max(), 50)
-        T, K = np.meshgrid(ti, ki)
 
-        Zi = griddata((X, Y), Z, (T, K), method='linear')
+if y_axis_option == "Strike Price ($)":
+    Y = df["strike"].to_numpy(dtype=float)
+    y_label = "Strike Price ($)"
+else:
+    Y = df["moneyness"].to_numpy(dtype=float)
+    y_label = "Moneyness (Strike / Spot)"
 
-        Zi = np.ma.array(Zi, mask=np.isnan(Zi))
+X = df["timetoexpiration"].to_numpy(dtype=float)
+Z = df["impliedvolatility"].to_numpy(dtype=float)
 
-        fig = go.Figure(data=[go.Surface(
-            x=T, y=K, z=Zi,
-            colorscale='Viridis',
-            colorbar_title='Implied Volatility (%)'
-        )])
+if len(X) < 10:
+    st.error("Too few points to build a surface; broaden filters or increase expiries.")
+    st.stop()
 
-        fig.update_layout(
-            title=f'Implied Volatility Surface for {ticker_symbol} Options',
-            scene=dict(
-                xaxis_title='Time to Expiration (years)',
-                yaxis_title=y_label,
-                zaxis_title='Implied Volatility (%)'
-            ),
-            autosize=False,
-            width=900,
-            height=800,
-            margin=dict(l=65, r=50, b=65, t=90)
-        )
+ti = np.linspace(X.min(), X.max(), grid_res)
+yi = np.linspace(Y.min(), Y.max(), grid_res)
+Tg, Yg = np.meshgrid(ti, yi)
 
-        st.plotly_chart(fig)
+Zi = griddata((X, Y), Z, (Tg, Yg), method="linear")
+Zi = np.ma.array(Zi, mask=np.isnan(Zi))
+
+fig = go.Figure(data=[go.Surface(
+    x=Tg, y=Yg, z=Zi,
+    colorscale="Viridis",
+    colorbar_title="Implied Volatility (%)"
+)])
+fig.update_layout(
+    title=f"Implied Volatility Surface — {ticker_symbol} ({otype.title()}s)",
+    scene=dict(
+        xaxis_title="Time to Expiration (years)",
+        yaxis_title=y_label,
+        zaxis_title="Implied Volatility (%)"
+    ),
+    autosize=False, width=900, height=800,
+    margin=dict(l=65, r=50, b=65, t=90)
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+# Small summary
+st.caption(
+    f"Points used: {len(df):,} | Expiries: {df['expirationDate'].nunique():,} | "
+    f"Spot: {spot_price:.2f} | r={r:.4f}, q={q:.4f}"
+)
