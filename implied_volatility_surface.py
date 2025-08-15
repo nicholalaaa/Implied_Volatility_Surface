@@ -3,13 +3,14 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from scipy.interpolate import griddata
+from scipy.special import ndtr
 import streamlit as st
 import yfinance as yf
 
 
 def _norm_cdf(x: np.ndarray) -> np.ndarray:
     # erf-based normal CDF (fast, no SciPy)
-    return 0.5 * (1.0 + np.erf(x / np.sqrt(2.0)))
+    return ndtr(x)
 
 
 def bs_price(S, K, T, r, q, sigma, otype="call"):
