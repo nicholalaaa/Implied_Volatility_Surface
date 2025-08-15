@@ -1,6 +1,4 @@
 datetime
-jax
-jaxlib
 matplotlib
 numpy
 pandas
