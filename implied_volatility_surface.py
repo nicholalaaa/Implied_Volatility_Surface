@@ -180,7 +180,7 @@ df["timetoexpiration"] = df["daystoexpiration"] / 365.0
 df = df[df["otype"].str.lower() == otype.lower()]
 df = df[(df["strike"] >= spot_price * (min_strike_pct / 100.0)) &
         (df["strike"] <= spot_price * (max_strike_pct / 100.0))]
-df = df[df["timeToExpiration"] > 7/365.0]  # keep > ~1 week to avoid near-zero T
+df = df[df["timetoexpiration"] > 7/365.0]  # keep > ~1 week to avoid near-zero T
 
 # Downsample per expiry for speed (optional)
 df["expirationDate"] = pd.to_datetime(df["expirationdate"])
