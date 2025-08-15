@@ -40,11 +40,9 @@ streamlit
 ```bash
 streamlit run implied_volatility_surface.py
 ```
-Open the URL shown by Streamlit (usually http://localhost:8501).
 
-### Deploy on Streamlit Community Cloud
-- Set the **Main file path** to `implied_volatility_surface.py` in the app settings.
-- (Optional) Add `runtime.txt` with your Python version, e.g., `python-3.11.9`.
+### Run on Streamlit Website
+- Visit https://implied-volatility-surface-nicolalaaa.streamlit.app/
 
 ---
 
@@ -65,11 +63,11 @@ The app fetches option chains ≥ 7 days out, computes mid prices, solves implie
 ## Numerical Details
 
 - **Model**: Black–Scholes with continuous dividend yield.  
-- **IV Solver**: Newton–Raphson on price with **analytic vega** (no autograd).
+- **IV Solver**: Newton–Raphson on price with **analytic vega**.
   - Initialization `σ₀ = 0.25` (configurable in code)  
   - Tolerance `1e-4` on absolute price error; max 25 iterations  
   - Guards: intrinsic-value check, **vega floor** (`1e-8`), sigma clipping to `[1e-6, 5]`
-- **Normal CDF**: `scipy.special.ndtr` (avoids `np.erf` issues across NumPy versions).  
+- **Normal CDF**: `scipy.special.ndtr`
 - **Interpolation**: `scipy.interpolate.griddata` (linear). Increase grid size for a denser mesh.
 
 > **Tip:** Use **Moneyness** instead of raw strike for a more uniform surface across expiries.
@@ -84,29 +82,6 @@ The app fetches option chains ≥ 7 days out, computes mid prices, solves implie
 
 ---
 
-## Troubleshooting
-
-- **`KeyError: 'daystoexpiration'`** — keep derived columns all lowercase after `rename(columns=str.lower)` (e.g., `daystoexpiration`, `timetoexpiration`, `impliedvolatility`).  
-- **`AttributeError: module 'numpy' has no attribute 'erf'`** — use `scipy.special.ndtr` for the normal CDF (already in this code).  
-- **Streamlit Cloud: “Main module file does not exist”** — set the Main file path to `implied_volatility_surface.py` or add a thin launcher with that exact name.
-
----
-
-## Roadmap
-
-- Cross-section plots (smile at fixed maturity; term structure at fixed moneyness)  
-- Optional bracketed fallback (Brent/bisection) for low-vega cases  
-- Pull `r` from a Treasury curve and `q` from dividend history  
-- SVI/SSVI or SABR smoothing and calibration
-
----
-
-## License
-
-MIT — see `LICENSE` (add one if missing).
-
----
-
 ## Acknowledgments
 
-Built with **NumPy**, **pandas**, **SciPy**, **Plotly**, **yfinance**, and **Streamlit**. Thanks to the open-source community.
+Built with **NumPy**, **pandas**, **SciPy**, **Plotly**, **yfinance**, and **Streamlit**.
